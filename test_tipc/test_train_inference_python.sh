@@ -154,7 +154,7 @@ function func_inference(){
 }
 
 if [ ${MODE} = "whole_infer" ]; then
-    GPUID=$3
+    GPUID=$CUDA_VISIBLE_DEVICES
     if [ ${#GPUID} -le 0 ];then
         env=" "
     else
@@ -197,12 +197,12 @@ else
         if [ ${gpu} = "-1" ];then
             env=""
         elif [ ${#gpu} -le 1 ];then
-            env="export CUDA_VISIBLE_DEVICES=${gpu}"
+            env="export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
             eval ${env}
         elif [ ${#gpu} -le 15 ];then
             IFS=","
             array=(${gpu})
-            env="export CUDA_VISIBLE_DEVICES=${gpu}"
+            env="export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
             IFS="|"
         else
             IFS=";"
