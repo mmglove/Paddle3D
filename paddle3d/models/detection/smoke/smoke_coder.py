@@ -51,10 +51,10 @@ class SMOKECoder(paddle.nn.Layer):
 
         ry = paddle.reshape(i_temp.tile([N, 1]), (N, -1, 3))
 
-        ry[:, 0, 0] *= cos
-        ry[:, 0, 2] *= sin
-        ry[:, 2, 0] *= sin
-        ry[:, 2, 2] *= cos
+        ry[:, 0, 0] = cos
+        ry[:, 0, 2] = sin
+        ry[:, 2, 0] = -sin
+        ry[:, 2, 2] = cos
         return ry
 
     def encode_box3d(self, rotys, dims, locs):
@@ -133,9 +133,8 @@ class SMOKECoder(paddle.nn.Layer):
         points = paddle.reshape(points, (-1, 2))
         assert points.shape[0] == N
 
-        # int + float -> int, but float + int -> float
         # proj_points = points + points_offset
-        proj_points = points_offset + points
+        proj_points = points_offset + points.astype(points_offset.dtype)
 
         # transform project points in homogeneous form.
         proj_points_extend = paddle.concat(

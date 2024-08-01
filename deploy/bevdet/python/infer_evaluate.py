@@ -12,16 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import time
 import argparse
 import os
 import random
-import copy
-
 import numpy as np
+
 import paddle
 from paddle import inference
 
-from paddle3d.ops.ms_deform_attn import ms_deform_attn
 from paddle3d.apis.config import Config
 from paddle3d.apis.trainer import Trainer
 from paddle3d.slim import get_qat_config
@@ -29,6 +28,7 @@ from paddle3d.utils.checkpoint import load_pretrained_model
 from paddle3d.utils.logger import logger
 from paddle3d.sample import Sample, SampleMeta
 from paddle3d.geometries import BBoxes3D
+from paddle3d.ops import bev_pool_v2
 
 
 def parse_args():
@@ -122,7 +122,7 @@ def load_predictor(model_file,
 
     # enable memory optim
     config.enable_memory_optim()
-    config.disable_glog_info()
+    # config.disable_glog_info()
 
     config.switch_use_feed_fetch_ops(False)
     config.switch_ir_optim(True)
@@ -153,39 +153,6 @@ def load_predictor(model_file,
 
 def worker_init_fn(worker_id):
     np.random.seed(1024)
-
-
-def _parse_results_to_sample(results: dict, sample: dict):
-    num_samples = len(results)
-    new_results = []
-    for i in range(num_samples):
-        data = Sample(None, sample["modality"][i])
-        bboxes_3d = results[i]["boxes_3d"]
-        labels = results[i]["labels_3d"]
-        confidences = results[i]["scores_3d"]
-        bottom_center = bboxes_3d[:, :3]
-        gravity_center = np.zeros_like(bottom_center)
-        gravity_center[:, :2] = bottom_center[:, :2]
-        gravity_center[:, 2] = bottom_center[:, 2] + bboxes_3d[:, 5] * 0.5
-        bboxes_3d[:, :3] = gravity_center
-        data.bboxes_3d = BBoxes3D(bboxes_3d[:, 0:7])
-        data.bboxes_3d.coordmode = 'Lidar'
-        data.bboxes_3d.origin = [0.5, 0.5, 0.5]
-        data.bboxes_3d.rot_axis = 2
-        data.bboxes_3d.velocities = bboxes_3d[:, 7:9]
-        data['bboxes_3d_numpy'] = bboxes_3d[:, 0:7]
-        data['bboxes_3d_coordmode'] = 'Lidar'
-        data['bboxes_3d_origin'] = [0.5, 0.5, 0.5]
-        data['bboxes_3d_rot_axis'] = 2
-        data['bboxes_3d_velocities'] = bboxes_3d[:, 7:9]
-        data.labels = labels
-        data.confidences = confidences
-        data.meta = SampleMeta(id=sample["meta"][i]['id'])
-        if "calibs" in sample:
-            calib = [calibs.numpy()[i] for calibs in sample["calibs"]]
-            data.calibs = calib
-        new_results.append(data)
-    return new_results
 
 
 def main(args):
@@ -235,72 +202,138 @@ def main(args):
                                args.collect_shape_info, args.dynamic_shape_file)
 
     trainer = Trainer(**dic)
+    trainer.model.eval()
+
     metric_obj = trainer.val_dataset.metric
     msg = 'evaluate on validate dataset'
-    prev_bev = None
-    prev_pos = np.array([0.0, 0.0, 0.0]).astype('float32')
-    prev_angle = np.array([0.0]).astype('float32')
-    scene_token = None
+    infer_time = 0
     for idx, sample in enumerate(trainer.eval_dataloader):
-        input = []
         if idx % 100 == 0:
             print('predict idx:', idx)
-        img_metas = sample['meta']
-        img = sample['img'][0].numpy().astype(np.float32)
-        input.append(img)
 
-        if img_metas[0]['scene_token'] != scene_token:
-            # the first sample of each scene is truncated
-            prev_bev = None
-        # update idx
-        scene_token = img_metas[0]['scene_token']
+        img_inputs = sample['img_inputs']
+        trainer.model.align_after_view_transfromation = True
+        feat_prev, input_data = trainer.model.extract_img_feat(
+            img_inputs, img_metas=None, pred_prev=True, sequential=False)
+        imgs, rots_curr, trans_curr, intrins = input_data[:4]
+        rots_prev, trans_prev, post_rots, post_trans, bda = input_data[4:]
 
-        can_bus = img_metas[0]['can_bus'].numpy().astype(np.float32)
-        tmp_pos = copy.deepcopy(can_bus[:3])
-        tmp_angle = copy.deepcopy(can_bus[-1])
-        if prev_bev is None:
-            can_bus[:3] = 0
-            can_bus[-1] = 0
-        else:
-            can_bus[:3] -= prev_pos
-            can_bus[-1] -= prev_angle
-        if prev_bev is None:
-            prev_bev = np.zeros((2500, 1, 256)).astype(np.float32)
-        input.append(prev_bev)
-        input.append(can_bus)
-        prev_pos = tmp_pos
-        prev_angle = tmp_angle
+        mlp_input = trainer.model.img_view_transformer.get_mlp_input(*[
+            rots_curr[0:1, ...], trans_curr[0:1, ...], intrins, post_rots,
+            post_trans, bda[0:1, ...]
+        ])
+        ranks_bev, ranks_depth, ranks_feat, interval_starts, interval_lengths = trainer.model.get_bev_pool_input(
+            [
+                imgs, rots_curr[0:1, ...], trans_curr[0:1, ...], intrins,
+                post_rots, post_trans, bda[0:1, ...], mlp_input
+            ])
 
-        img_shape = np.asarray(img_metas[0]['img_shape']).astype(np.float32)
-        input.append(img_shape)
-
-        img2lidars = []
-        for img_meta in img_metas:
-            img2lidars.append(np.asarray(img_meta['lidar2img']))
-
-        img2lidars = np.asarray(img2lidars).astype('float32')
-        input.append(img2lidars)
+        _, C, H, W = feat_prev.shape
+        feat_prev = trainer.model.shift_feature(
+            feat_prev, [trans_curr, trans_prev], [rots_curr, rots_prev], bda)
+        feat_prev = feat_prev.reshape(
+            [1, (trainer.model.num_frame - 1) * C, H, W])
 
         input_names = predictor.get_input_names()
-        for i, name in enumerate(input_names):
-            input_tensor = predictor.get_input_handle(name)
-            input_tensor.reshape(input[i].shape)
-            input_tensor.copy_from_cpu(input[i].copy())
+
+        input_tensor0 = predictor.get_input_handle(input_names[0])
+        input_tensor1 = predictor.get_input_handle(input_names[1])
+        input_tensor2 = predictor.get_input_handle(input_names[2])
+        input_tensor3 = predictor.get_input_handle(input_names[3])
+        input_tensor4 = predictor.get_input_handle(input_names[4])
+        input_tensor5 = predictor.get_input_handle(input_names[5])
+        input_tensor6 = predictor.get_input_handle(input_names[6])
+        input_tensor7 = predictor.get_input_handle(input_names[7])
+
+        input_tensor0.copy_from_cpu(imgs.numpy())
+        input_tensor1.copy_from_cpu(feat_prev.numpy())
+        input_tensor2.copy_from_cpu(mlp_input.numpy())
+        input_tensor3.copy_from_cpu(ranks_depth.numpy())
+        input_tensor4.copy_from_cpu(ranks_feat.numpy())
+        input_tensor5.copy_from_cpu(ranks_bev.numpy())
+        input_tensor6.copy_from_cpu(interval_starts.numpy())
+        input_tensor7.copy_from_cpu(interval_lengths.numpy())
+
+        paddle.device.cuda.synchronize()
+        start = time.time()
         predictor.run()
 
-        outs = []
+        outs_ = []
         output_names = predictor.get_output_names()
         for name in output_names:
             out = predictor.get_output_handle(name)
             out = out.copy_to_cpu()
-            outs.append(out)
-        prev_bev = outs[0]
-        result = {}
-        result['boxes_3d'] = outs[1]
-        result['labels_3d'] = outs[2]
-        result['scores_3d'] = outs[3]
-        pred = _parse_results_to_sample([result], sample)
-        metric_obj.update(predictions=pred, ground_truths=sample)
+            outs_.append(out)
+        paddle.device.cuda.synchronize()
+
+        if idx >= 10 and idx < 110:
+            infer_time += (time.time() - start)
+            if idx == 109:
+                print('infer time:', infer_time / 100)
+
+        outs = [paddle.to_tensor(out) for out in outs_]
+        out_list = [
+            {
+                'reg': outs[3],
+                'height': outs[2],
+                'dim': outs[0],
+                'rot': outs[4],
+                'vel': outs[5],
+                'heatmap': outs[1]
+            },
+            {
+                'reg': outs[9],
+                'height': outs[8],
+                'dim': outs[6],
+                'rot': outs[10],
+                'vel': outs[11],
+                'heatmap': outs[7]
+            },
+            {
+                'reg': outs[15],
+                'height': outs[14],
+                'dim': outs[12],
+                'rot': outs[16],
+                'vel': outs[17],
+                'heatmap': outs[13]
+            },
+            {
+                'reg': outs[21],
+                'height': outs[20],
+                'dim': outs[18],
+                'rot': outs[22],
+                'vel': outs[23],
+                'heatmap': outs[19]
+            },
+            {
+                'reg': outs[27],
+                'height': outs[26],
+                'dim': outs[24],
+                'rot': outs[28],
+                'vel': outs[29],
+                'heatmap': outs[25]
+            },
+            {
+                'reg': outs[33],
+                'height': outs[32],
+                'dim': outs[30],
+                'rot': outs[34],
+                'vel': outs[35],
+                'heatmap': outs[31]
+            },
+        ]
+
+        bbox_list = trainer.model.pts_bbox_head.get_bboxes(
+            out_list, img_metas=None, rescale=False)
+        bbox_pts = [
+            trainer.model.bbox3d2result(bboxes, scores, labels)
+            for bboxes, scores, labels in bbox_list
+        ]
+        results = {}
+        results['pts_bbox'] = bbox_pts[0]
+
+        metric_obj.update(predictions=[results], ground_truths=sample)
+
     metrics = metric_obj.compute(verbose=True)
     print(metrics)
 
