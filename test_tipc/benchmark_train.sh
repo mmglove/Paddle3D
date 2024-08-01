@@ -175,20 +175,27 @@ for batch_size in ${batch_size_list[*]}; do
             gpu_id=$(set_gpu_id $device_num)
 
             if [ ${#gpu_id} -le 1 ];then
-                log_path="$SAVE_LOG/profiling_log"
-                mkdir -p $log_path
-                log_name="${repo_name}_${model_name}_bs${batch_size}_${precision}_${run_mode}_${device_num}_${to_static}profiling"
-                func_sed_params "$FILENAME" "${line_gpuid}" "0"  # sed used gpu_id
-                # set profile_option params
-                tmp=`sed -i "${line_profile}s/.*/${profile_option}/" "${FILENAME}"`
+                if [[ ${PROFILING_TIMER_ONLY} != "no" ]];then
+                    echo "run profile"
+                    if [[ ${PROFILING_TIMER_ONLY} = "False" ]];then
+                        profile_option="${profile_option};timer_only=False"
+                    fi
+                    log_path="$SAVE_LOG/profiling_log"
+                    mkdir -p $log_path
+                    log_name="${repo_name}_${model_name}_bs${batch_size}_${precision}_${run_mode}_${device_num}_${to_static}profiling"
+                    func_sed_params "$FILENAME" "${line_gpuid}" "0"  # sed used gpu_id
+                    # set profile_option params
+                    tmp=`sed -i "${line_profile}s/.*/${profile_option}/" "${FILENAME}"`
 
-                # run test_train_inference_python.sh
-                cmd="bash test_tipc/test_train_inference_python.sh ${FILENAME} benchmark_train > ${log_path}/${log_name} 2>&1 "
-                echo $cmd
-                eval $cmd
-                eval "cat ${log_path}/${log_name}"
+                    # run test_train_inference_python.sh
+                    cmd="timeout 2m bash test_tipc/test_train_inference_python.sh ${FILENAME} benchmark_train > ${log_path}/${log_name} 2>&1 "
+                    echo $cmd
+                    eval $cmd
+                    eval "cat ${log_path}/${log_name}"
+                fi
 
                 # without profile
+                echo "run without profile"
                 log_path="$SAVE_LOG/train_log"
                 speed_log_path="$SAVE_LOG/index"
                 mkdir -p $log_path
@@ -196,7 +203,7 @@ for batch_size in ${batch_size_list[*]}; do
                 log_name="${repo_name}_${model_name}_bs${batch_size}_${precision}_${run_mode}_${device_num}_${to_static}log"
                 speed_log_name="${repo_name}_${model_name}_bs${batch_size}_${precision}_${run_mode}_${device_num}_${to_static}speed"
                 func_sed_params "$FILENAME" "${line_profile}" "null"  # sed profile_id as null
-                cmd="bash test_tipc/test_train_inference_python.sh ${FILENAME} benchmark_train > ${log_path}/${log_name} 2>&1 "
+                cmd="timeout 5m bash test_tipc/test_train_inference_python.sh ${FILENAME} benchmark_train > ${log_path}/${log_name} 2>&1 "
                 echo $cmd
                 job_bt=`date '+%Y%m%d%H%M%S'`
                 eval $cmd
